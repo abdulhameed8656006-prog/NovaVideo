@@ -3,8 +3,12 @@ package com.abdulhameed.novavideo
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Typeface
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,6 +19,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
@@ -26,6 +31,8 @@ import android.widget.TextView
 import android.widget.Toast
 import android.widget.VideoView
 import java.io.File
+import java.io.FileOutputStream
+import kotlin.math.max
 
 class MainActivity : Activity() {
     private lateinit var home: LinearLayout
@@ -42,11 +49,18 @@ class MainActivity : Activity() {
     private lateinit var etKimi: EditText
     private lateinit var etHf: EditText
     private lateinit var cbBetter: CheckBox
+    private lateinit var ivThumb: ImageView
+    private lateinit var photoBox: LinearLayout
+    private lateinit var btnPhoto: Button
+    private lateinit var shapeBox: LinearLayout
 
     private var seconds = 4.0
     private var vidWidth = 704
     private var vidHeight = 512
     private var videoFile: File? = null
+    private var photoFile: File? = null
+    private var photoW = 1
+    private var photoH = 1
     private var busy = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -176,17 +190,39 @@ class MainActivity : Activity() {
             InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         createCard.addView(etIdea, wrap())
 
+        createCard.addView(Style.label(this, "Photo (optional)"))
+        btnPhoto = Style.softButton(this, "Add a photo") { pickPhoto() }
+        createCard.addView(btnPhoto, wrap())
+        photoBox = LinearLayout(this)
+        photoBox.orientation = LinearLayout.HORIZONTAL
+        photoBox.gravity = Gravity.CENTER_VERTICAL
+        photoBox.visibility = View.GONE
+        ivThumb = ImageView(this)
+        ivThumb.scaleType = ImageView.ScaleType.CENTER_CROP
+        photoBox.addView(ivThumb, LinearLayout.LayoutParams(dp(72), dp(72)))
+        val pinfo = Style.text(this, "Photo added. The video starts from it.", 14f, Style.TEXT, false)
+        pinfo.setPadding(dp(12), 0, dp(8), 0)
+        photoBox.addView(pinfo, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val remove = Style.text(this, "Remove", 14f, Style.ERROR, true)
+        remove.setPadding(dp(10), dp(10), dp(10), dp(10))
+        remove.setOnClickListener { clearPhoto() }
+        photoBox.addView(remove)
+        createCard.addView(photoBox, wrapTop(10))
+
         createCard.addView(Style.label(this, "Length"))
         val lengths = listOf(2.0, 4.0, 6.0)
         createCard.addView(chips(listOf("2 sec", "4 sec", "6 sec"), 1) { i -> seconds = lengths[i] }, wrap())
 
-        createCard.addView(Style.label(this, "Shape"))
+        shapeBox = LinearLayout(this)
+        shapeBox.orientation = LinearLayout.VERTICAL
+        shapeBox.addView(Style.label(this, "Shape"))
         val ws = listOf(704, 512, 512)
         val hs = listOf(512, 704, 512)
-        createCard.addView(chips(listOf("Wide", "Tall", "Square"), 0) { i ->
+        shapeBox.addView(chips(listOf("Wide", "Tall", "Square"), 0) { i ->
             vidWidth = ws[i]
             vidHeight = hs[i]
         }, wrap())
+        createCard.addView(shapeBox, wrap())
 
         val note = Style.text(
             this,
@@ -317,12 +353,100 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Photo ----------
+    private fun pickPhoto() {
+        val i = Intent(Intent.ACTION_GET_CONTENT)
+        i.type = "image/*"
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        startActivityForResult(Intent.createChooser(i, "Choose a photo"), 101)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 101 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        Thread {
+            try {
+                val f = loadPhoto(uri)
+                ui { setPhoto(f) }
+            } catch (e: Exception) {
+                val why = e.message ?: "unknown error"
+                ui { Toast.makeText(this, "Could not open that photo: $why", Toast.LENGTH_LONG).show() }
+            }
+        }.start()
+    }
+
+    private fun loadPhoto(uri: Uri): File {
+        val bounds = BitmapFactory.Options()
+        bounds.inJustDecodeBounds = true
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        val side = max(bounds.outWidth, bounds.outHeight)
+        while (side / sample > 2048) sample *= 2
+        val opts = BitmapFactory.Options()
+        opts.inSampleSize = sample
+        var bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+            ?: throw Exception("that is not a picture")
+        var degrees = 0
+        try {
+            contentResolver.openInputStream(uri)?.use { s ->
+                val ex = ExifInterface(s)
+                val o = ex.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+                degrees = when (o) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            }
+        } catch (e: Exception) {
+        }
+        if (degrees != 0) {
+            val m = Matrix()
+            m.postRotate(degrees.toFloat())
+            bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        }
+        val longest = max(bmp.width, bmp.height)
+        if (longest > 1024) {
+            val sc = 1024f / longest
+            bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * sc).toInt(), (bmp.height * sc).toInt(), true)
+        }
+        val f = File(cacheDir, "photo_" + System.currentTimeMillis() + ".jpg")
+        FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        photoW = bmp.width
+        photoH = bmp.height
+        return f
+    }
+
+    private fun setPhoto(f: File) {
+        photoFile = f
+        ivThumb.setImageURI(Uri.fromFile(f))
+        photoBox.visibility = View.VISIBLE
+        btnPhoto.text = "Change photo"
+        shapeBox.visibility = View.GONE
+        etIdea.hint = "What should happen? e.g. the dog runs toward the camera (optional)"
+    }
+
+    private fun clearPhoto() {
+        photoFile = null
+        photoBox.visibility = View.GONE
+        btnPhoto.text = "Add a photo"
+        shapeBox.visibility = View.VISIBLE
+        etIdea.hint = "e.g. a fox running through a neon city at night"
+    }
+
+    private fun shapeFromPhoto(): Pair<Int, Int> {
+        val ratio = photoW.toDouble() / photoH.toDouble()
+        return if (ratio > 1.15) Pair(704, 512) else if (ratio < 0.87) Pair(512, 704) else Pair(512, 512)
+    }
+
     // ---------- Actions ----------
     private fun onCreateClicked() {
         if (busy) return
         val idea = etIdea.text.toString().trim()
-        if (idea.isEmpty()) {
-            Toast.makeText(this, "Type your idea first", Toast.LENGTH_SHORT).show()
+        val photo = photoFile
+        if (idea.isEmpty() && photo == null) {
+            Toast.makeText(this, "Type your idea or add a photo first", Toast.LENGTH_SHORT).show()
             return
         }
         val hf = Keys.hf(this)
@@ -334,8 +458,9 @@ class MainActivity : Activity() {
         val kimi = Keys.kimi(this)
         val better = Keys.better(this)
         val secs = seconds
-        val w = vidWidth
-        val h = vidHeight
+        val dims = if (photo == null) Pair(vidWidth, vidHeight) else shapeFromPhoto()
+        val w = dims.first
+        val h = dims.second
 
         busy = true
         Api.reset()
@@ -350,10 +475,12 @@ class MainActivity : Activity() {
         Thread {
             try {
                 var scene = idea
-                if (kimi.isNotEmpty()) {
+                if (idea.isEmpty()) {
+                    scene = "The scene comes to life with gentle natural motion and a slow cinematic camera move."
+                } else if (kimi.isNotEmpty()) {
                     ui { tvStatus.text = "Kimi is writing your scene..." }
                     try {
-                        scene = Api.improvePrompt(kimi, idea)
+                        scene = Api.improvePrompt(kimi, idea, photo != null)
                         val shown = scene
                         ui { tvScene.text = shown }
                     } catch (e: Cancelled) {
@@ -364,7 +491,7 @@ class MainActivity : Activity() {
                     }
                 }
                 val out = File(cacheDir, "nova_" + System.currentTimeMillis() + ".mp4")
-                Api.generateVideo(hf, scene, secs, w, h, better, out) { msg -> ui { tvStatus.text = msg } }
+                Api.generateVideo(hf, scene, secs, w, h, better, photo, out) { msg -> ui { tvStatus.text = msg } }
                 videoFile = out
                 ui { showResult(out) }
             } catch (e: Cancelled) {

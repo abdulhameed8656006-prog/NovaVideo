@@ -37,6 +37,13 @@ object Api {
             "order, the setting, the camera movement, the lighting and the visual style. Do not add " +
             "titles, lists, quotation marks or any extra text. Output only the paragraph."
 
+    private const val PHOTO_PROMPT =
+        "You write prompts for an AI image-to-video model. The user has a photo and tells you what " +
+            "should happen. Write ONE short paragraph of 30 to 60 words in English that describes only " +
+            "the motion: how the subject moves, how the camera moves, and subtle motion in the " +
+            "background and light. Do not describe a different scene. Do not add titles, lists or " +
+            "quotation marks. Output only the paragraph."
+
     @Volatile
     var cancelled = false
 
@@ -84,22 +91,23 @@ object Api {
     }
 
     // ---- Kimi: rewrite the idea as a detailed scene description ----
-    private fun kimiBody(idea: String, withEffort: Boolean): String {
+    private fun kimiBody(system: String, idea: String, withEffort: Boolean): String {
         val msgs = JSONArray()
-        msgs.put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
+        msgs.put(JSONObject().put("role", "system").put("content", system))
         msgs.put(JSONObject().put("role", "user").put("content", idea))
         val o = JSONObject().put("model", KIMI_MODEL).put("messages", msgs)
         if (withEffort) o.put("reasoning_effort", "low")
         return o.toString()
     }
 
-    fun improvePrompt(key: String, idea: String): String {
+    fun improvePrompt(key: String, idea: String, hasPhoto: Boolean): String {
+        val system = if (hasPhoto) PHOTO_PROMPT else SYSTEM_PROMPT
         try {
             val headers = HashMap<String, String>()
             headers["Authorization"] = "Bearer $key"
-            var r = postJson(KIMI_URL, headers, kimiBody(idea, true), 90000)
+            var r = postJson(KIMI_URL, headers, kimiBody(system, idea, true), 90000)
             if (r.first !in 200..299 && !cancelled) {
-                r = postJson(KIMI_URL, headers, kimiBody(idea, false), 90000)
+                r = postJson(KIMI_URL, headers, kimiBody(system, idea, false), 90000)
             }
             if (cancelled) throw Cancelled()
             if (r.first == 401) throw ApiError("Kimi did not accept the key")
@@ -159,19 +167,61 @@ object Api {
         return null
     }
 
+    private fun uploadFile(prefix: String, file: File, auth: Map<String, String>): Pair<Int, String> {
+        val boundary = "----nova" + System.currentTimeMillis()
+        val h = HashMap<String, String>(auth)
+        h["Content-Type"] = "multipart/form-data; boundary=" + boundary
+        val conn = open(SPACE + prefix + "/upload", "POST", h, 120000)
+        conn.doOutput = true
+        conn.outputStream.use { out ->
+            val head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"files\"; " +
+                "filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+            out.write(head.toByteArray(Charsets.UTF_8))
+            out.write(file.readBytes())
+            out.write(("\r\n--" + boundary + "--\r\n").toByteArray(Charsets.UTF_8))
+        }
+        val code = conn.responseCode
+        val text = readBody(conn)
+        conn.disconnect()
+        return Pair(code, text)
+    }
+
     fun generateVideo(
         hf: String, prompt: String, seconds: Double, width: Int, height: Int,
-        better: Boolean, dest: File, onStatus: (String) -> Unit
+        better: Boolean, photo: File?, dest: File, onStatus: (String) -> Unit
     ) {
         try {
+            val auth = HashMap<String, String>()
+            if (hf.isNotEmpty()) auth["Authorization"] = "Bearer $hf"
+
+            var prefix = "/gradio_api"
+            var fileData: Any = JSONObject.NULL
+            if (photo != null) {
+                onStatus("Uploading your photo...")
+                var up = uploadFile(prefix, photo, auth)
+                if (up.first == 404) {
+                    prefix = ""
+                    up = uploadFile(prefix, photo, auth)
+                }
+                if (cancelled) throw Cancelled()
+                if (up.first !in 200..299) throw ApiError(httpMessage(up.first))
+                val path = JSONArray(up.second).getString(0)
+                fileData = JSONObject()
+                    .put("path", path)
+                    .put("orig_name", "photo.jpg")
+                    .put("meta", JSONObject().put("_type", "gradio.FileData"))
+            }
+
+            val endpoint = if (photo != null) "image_to_video" else "text_to_video"
+            val mode = if (photo != null) "image-to-video" else "text-to-video"
             val data = JSONArray()
             data.put(prompt)
             data.put(NEGATIVE)
-            data.put(JSONObject.NULL)
+            data.put(fileData)
             data.put(JSONObject.NULL)
             data.put(height)
             data.put(width)
-            data.put("text-to-video")
+            data.put(mode)
             data.put(seconds)
             data.put(9)
             data.put(42)
@@ -180,19 +230,15 @@ object Api {
             data.put(better)
             val body = JSONObject().put("data", data).toString()
 
-            val auth = HashMap<String, String>()
-            if (hf.isNotEmpty()) auth["Authorization"] = "Bearer $hf"
-
-            var prefix = "/gradio_api"
             var eventId = ""
             for (attempt in 0..1) {
-                val r = postJson(SPACE + prefix + "/call/text_to_video", auth, body, 60000)
+                val r = postJson(SPACE + prefix + "/call/" + endpoint, auth, body, 60000)
                 if (cancelled) throw Cancelled()
                 if (r.first in 200..299) {
                     eventId = JSONObject(r.second).getString("event_id")
                     break
                 }
-                if (r.first == 404 && attempt == 0) {
+                if (r.first == 404 && prefix.isNotEmpty()) {
                     prefix = ""
                     continue
                 }
@@ -200,7 +246,7 @@ object Api {
             }
 
             onStatus("Waiting for a free GPU. This can take a few minutes. Keep the app open.")
-            val conn = open(SPACE + prefix + "/call/text_to_video/" + eventId, "GET", auth, 900000)
+            val conn = open(SPACE + prefix + "/call/" + endpoint + "/" + eventId, "GET", auth, 900000)
             conn.setRequestProperty("Accept", "text/event-stream")
             val code = conn.responseCode
             if (code !in 200..299) {
